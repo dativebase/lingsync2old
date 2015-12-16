@@ -1,0 +1,6 @@
+files/*
+oldjson/*
+lingsyncjson/*
+*.sw?
+*.pyc
+
