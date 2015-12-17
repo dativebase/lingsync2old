@@ -72,7 +72,10 @@ class OLDClient(object):
         self.__setcreateparams__()
         self.host = host
         self.port = port
-        self.baseurl = '%s://%s:%s' % (scheme, host, port)
+        if port:
+            self.baseurl = '%s://%s:%s' % (scheme, host, port)
+        else:
+            self.baseurl = '%s://%s' % (scheme, host)
         self.session = requests.Session()
         self.session.headers.update({'Content-Type': 'application/json'})
 
