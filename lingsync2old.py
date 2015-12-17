@@ -139,6 +139,7 @@ import optparse
 import getpass
 import sys
 import os
+import shutil
 import re
 import pprint
 import copy
@@ -2962,6 +2963,7 @@ def create_old_tags(old_data, c, old_url, lingsync_corpus_name, relational_map):
                 resources_created.append(r['id'])
                 relational_map['tags'][tag['name']] = r['id']
             except:
+                p(r)
                 sys.exit(u'%sFailed to create an OLD tag \u2018%s\u2019.'
                     u' Aborting.%s' % (ANSI_FAIL, tag['name'], ANSI_ENDC))
 
