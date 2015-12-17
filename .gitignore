@@ -1,6 +1,6 @@
-files/*
-oldjson/*
-lingsyncjson/*
+_ls2old_files/*
+_ls2old_oldjson/*
+_ls2old_lingsyncjson/*
 *.sw?
 *.pyc
 
