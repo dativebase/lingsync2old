@@ -92,16 +92,19 @@ It's essentially a three-step algorithm:
    OLD web service.
 
 Here is the general mapping from LingSync documents (or implicit entities) to
-OLD resources:
+OLD resources.
 
-    LingSync         OLD
-    tags        =>   tags
-    users       =>   users
-    speakers    =>   speakers
-    files       =>   files
-    datums      =>   forms
-    datalists   =>   corpora
-    sessions    =>   collections
++------------+-------------+
+| LingSync   | OLD         |
++============+=============+
+| tags       | tags        |
+| users      | users       |
+| speakers   | speakers    |
+| files      | files       |
+| datums     | forms       |
+| datalists  | corpora     |
+| sessions   | collections |
++------------+-------------+
 
 
 Questions
