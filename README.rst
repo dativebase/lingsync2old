@@ -39,7 +39,7 @@ You can also supploy the required arguments as options::
             --old-username=my-old-username \
             --old-password=my-old-password
 
-Full param/option listing:
+Full param/option listing::
 
     --force-download: boolean that, when `True`, forces the downloading of the
         LingSync/CouchDB data, even if we have already downloaded it. Default
