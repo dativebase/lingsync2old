@@ -68,49 +68,46 @@ class OLDClient(object):
 
     """
 
-    def __init__(self, host, port, scheme='http'):
+    def __init__(self, url):
         self.__setcreateparams__()
-        self.host = host
-        self.port = port
-        if port:
-            self.baseurl = '%s://%s:%s' % (scheme, host, port)
-        else:
-            self.baseurl = '%s://%s' % (scheme, host)
+        self.url = url
         self.session = requests.Session()
         self.session.headers.update({'Content-Type': 'application/json'})
 
     def login(self, username, password):
         payload = json.dumps({'username': username, 'password': password})
-        response = self.session.post('%s/login/authenticate' % self.baseurl,
+        response = self.session.post('%s/login/authenticate' % self.url,
             data=payload)
+        print '%s/login/authenticate' % self.url
+        print response.text
         return response.json().get('authenticated', False)
 
     def get(self, path, params=None, verbose=True):
-        response = self.session.get('%s/%s' % (self.baseurl, path),
+        response = self.session.get('%s/%s' % (self.url, path),
             params=params)
         return self.return_response(response, verbose=verbose)
 
     def post(self, path, data=json.dumps({})):
-        response = self.session.post('%s/%s' % (self.baseurl, path),
+        response = self.session.post('%s/%s' % (self.url, path),
             data=json.dumps(data))
         return self.return_response(response)
 
     create = post
 
     def put(self, path, data=json.dumps({})):
-        response = self.session.put('%s/%s' % (self.baseurl, path),
+        response = self.session.put('%s/%s' % (self.url, path),
             data=json.dumps(data))
         return self.return_response(response)
 
     update = put
 
     def delete(self, path, data=json.dumps({})):
-        response = self.session.delete('%s/%s' % (self.baseurl, path),
+        response = self.session.delete('%s/%s' % (self.url, path),
             data=json.dumps(data))
         return self.return_response(response)
 
     def search(self, path, data):
-        response = self.session.request('SEARCH', '%s/%s' % (self.baseurl,
+        response = self.session.request('SEARCH', '%s/%s' % (self.url,
             path), data=json.dumps(data))
         return self.return_response(response)
 

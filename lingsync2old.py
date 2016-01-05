@@ -2463,11 +2463,7 @@ def upload(options, old_data_fname):
     old_username = getattr(options, 'old_username', None)
     old_password = getattr(options, 'old_password', None)
     lingsync_corpus_name = getattr(options, 'ls_corpus', None)
-    parsed_old_url = urlparse.urlparse(old_url)
-    host = parsed_old_url.hostname
-    port = parsed_old_url.port
-    scheme = parsed_old_url.scheme
-    c = OLDClient(host, port, scheme)
+    c = OLDClient(old_url)
 
     # Log in to the OLD.
     logged_in = c.login(old_username, old_password)
