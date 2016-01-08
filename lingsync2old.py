@@ -178,6 +178,16 @@ ANSI_UNDERLINE = '\033[4m'
 
 migration_tag_name = None
 
+
+def flush(string):
+    """Print `string` immediately, and with no carriage return.
+
+    """
+
+    print string,
+    sys.stdout.flush()
+
+
 def download_lingsync_json(config_dict, database_name):
     """Download the LingSync data in `database_name` using the CouchDB API.
     Save the returned JSON to a local file.
@@ -196,7 +206,7 @@ def download_lingsync_json(config_dict, database_name):
         return None
 
     # Get the JSON from CouchDB
-    print 'Downloading all documents from %s' % database_name
+    flush('Downloading all documents from %s' % database_name)
     all_docs = c.get_all_docs_list(database_name)
     if type(all_docs) is type({}) and all_docs.get('error') == 'unauthorized':
         print (u'%sUser %s is not authorized to access the LingSync corpus'
@@ -521,7 +531,7 @@ def lingsync2old(fname, lingsync_db_name, force_file_download):
     for r in rows:
         if get_collection_for_lingsync_doc(r.get('doc', {})) == 'datums':
             old_object = process_lingsync_datum(r['doc'],
-                old_data['collections'])
+                old_data['collections'], lingsync_db_name)
             old_data, warnings = update_state(old_object, old_data, warnings)
 
     # Note: LingSync corpus and private_corpus documents don't appear to
@@ -1340,7 +1350,7 @@ def process_lingsync_user(doc):
     return oldobj
 
 
-def process_lingsync_datum(doc, collections):
+def process_lingsync_datum(doc, collections, lingsync_db_name):
     """Process a LingSync datum. This will be encoded as an OLD form.
 
     """
@@ -1367,7 +1377,9 @@ def process_lingsync_datum(doc, collections):
         'modifiedByUser', # Can contain an array in its 'users' attribute. Forget what, exactly, this array can contain.
         'comments',
         'markAsNeedsToBeSaved', # Ignoring this. Strangely, there can be multiple fields with this label in a datimFields array ...
-        'checked' # Ignoring this. It can evaluate to `true`, but and may be relevant to `validationStatus` and the OLD form's `status`, but I think it's safe to ignore it.
+        'checked', # Ignoring this. It can evaluate to `true`, but and may be relevant to `validationStatus` and the OLD form's `status`, but I think it's safe to ignore it.
+        'notes', # non-standard but attested
+        'phonetic' # non-standard but attested
     ]
 
     known_attrs = [
@@ -1455,34 +1467,35 @@ def process_lingsync_datum(doc, collections):
     # Attempt to create a MM/DD/YYYY string from `date_session_elicited`. At
     # present, we are only recognizing date strings in MM/DD/YYYY and
     # YYYY-MM-DD formats.
-    session_fields = ls_session.get('sessionFields', [])
     date_datum_elicited_unparseable = False
-    date_session_elicited = get_val_from_session_fields('dateElicited', session_fields)
-    if date_session_elicited:
-        date_elicited = None
-        try:
-            datetime_inst = datetime.datetime.strptime(date_session_elicited,
-                '%Y-%m-%d')
-        except Exception, e:
-            try:
-                datetime_inst = datetime.datetime.strptime(
-                    date_session_elicited, '%m/%d/%Y')
-            except Exception, e:
-                datetime_inst = None
-                date_datum_elicited_unparseable = True
-                warnings['docspecific'].append(u'Unable to parse %s to an OLD-compatible date'
-                    u' in MM/DD/YYYY format for datum %s.' % (
-                    date_session_elicited, datum_id))
-        if datetime_inst:
-            y = datetime_inst.year
-            m = datetime_inst.month
-            d = datetime_inst.day
-            date_elicited = u'%s/%s/%s' % (str(m).zfill(2),
-                str(d).zfill(2), str(y))
-        else:
+    if ls_session:
+        session_fields = ls_session.get('sessionFields', [])
+        date_session_elicited = get_val_from_session_fields('dateElicited', session_fields)
+        if date_session_elicited:
             date_elicited = None
-        if date_elicited:
-            old_form['date_elicited'] = date_elicited
+            try:
+                datetime_inst = datetime.datetime.strptime(date_session_elicited,
+                    '%Y-%m-%d')
+            except Exception, e:
+                try:
+                    datetime_inst = datetime.datetime.strptime(
+                        date_session_elicited, '%m/%d/%Y')
+                except Exception, e:
+                    datetime_inst = None
+                    date_datum_elicited_unparseable = True
+                    warnings['docspecific'].append(u'Unable to parse %s to an OLD-compatible date'
+                        u' in MM/DD/YYYY format for datum %s.' % (
+                        date_session_elicited, datum_id))
+            if datetime_inst:
+                y = datetime_inst.year
+                m = datetime_inst.month
+                d = datetime_inst.day
+                date_elicited = u'%s/%s/%s' % (str(m).zfill(2),
+                    str(d).zfill(2), str(y))
+            else:
+                date_elicited = None
+            if date_elicited:
+                old_form['date_elicited'] = date_elicited
 
     # Files. Array of OLD file objects. The `audioVideo` attribute holds an
     # array of objects, each of which has 'URL' and 'type' attributes. The
@@ -1580,6 +1593,9 @@ def process_lingsync_datum(doc, collections):
         old_form['__lingsync_deleted'] = True
 
     # Speaker. Null or a valid speaker resource. From datum.session.consultants.
+    # WARNING: it's not practical to try to perfectly parse free-form
+    # consultants values.
+
     speakers = []
     if ls_session:
         session_fields = ls_session.get('sessionFields')
@@ -1590,28 +1606,48 @@ def process_lingsync_datum(doc, collections):
         if not dialect:
             dialect = ls_session.get('dialect')
         if consultants:
-            for consultant in consultants.split():
+            consultants_list = consultants.split()
+            # If consultants is two capitalized words, e.g., Dave Smith, then
+            # we assume we have a first name/ last name situation.
+            if len(consultants_list) == 2 and \
+            consultants_list[0] == consultants_list[0].lower().capitalize() and \
+            consultants_list[1] == consultants_list[1].lower().capitalize():
                 old_speaker = copy.deepcopy(old_schemata['speaker'])
-                # If consultant is all-caps, we assume it is initials, where the
-                # first char is the first name initial and the remaining char(s)
-                # is/are the last name initial(s).
-                if consultant.upper() == consultant:
-                    old_speaker['first_name'] = consultant[0]
-                    old_speaker['last_name'] = consultant[1:]
-                else:
-                    old_speaker['first_name'] = consultant
-                    old_speaker['last_name'] = consultant
-                if dialect:
-                    old_speaker['dialect'] = dialect
+                old_speaker['first_name'] = consultants_list[0]
+                old_speaker['last_name'] = consultants_list[1]
                 speakers.append(old_speaker)
+            # Otherwise, we assume we have an initials situation (e.g., DS).
+            else:
+                for consultant in consultants_list:
+                    old_speaker = copy.deepcopy(old_schemata['speaker'])
+                    # If consultant is all-caps, we assume it is initials, where the
+                    # first char is the first name initial and the remaining char(s)
+                    # is/are the last name initial(s).
+                    if consultant.upper() == consultant:
+                        old_speaker['first_name'] = consultant[0]
+                        old_speaker['last_name'] = consultant[1:]
+                    else:
+                        old_speaker['first_name'] = consultant
+                        old_speaker['last_name'] = consultant
+                    if dialect:
+                        old_speaker['dialect'] = dialect
+                    speakers.append(old_speaker)
+
     if len(speakers) >= 1:
         old_form['speaker'] = speakers[0]
         if len(speakers) > 1:
-            warnings['docspecific'].append('Datum %s has more than one consultant listed. Since'
-                ' OLD forms only allow one speaker, we are just going to'
-                ' associate the first speaker to the OLD form created'
-                ' form this LingSync datum. The additional LingSync speakers'
-                ' will still be created as OLD speakers, however.' % datum_id)
+            warnings['docspecific'].append('Datum %s has more than one'
+                ' consultant listed. Since OLD forms only allow one speaker, we'
+                ' are just going to associate the first speaker to the OLD form'
+                ' created form this LingSync datum. The additional LingSync'
+                ' speakers will still be created as OLD speakers, however, and'
+                ' ALL LingSync consultants will be documented in the form\'s'
+                ' comments field.' % datum_id)
+            speaker_strs = [u'%s %s' % (s['first_name'], s['last_name']) for s
+                in speakers]
+            old_comments.append(punctuate_period_safe(
+                'Consultants: %s' % u', '.join(speaker_strs)))
+
     for speaker in speakers:
         auxiliary_resources.setdefault('speakers', []).append(speaker)
 
@@ -1669,9 +1705,42 @@ def process_lingsync_datum(doc, collections):
         else:
             old_form['morpheme_break'] = ls_morphemes
 
+    # Phonetic Transcription. Max 255 chars. From the non-standard LingSync
+    # field "phonetic".
+    ls_phonetic = get_val_from_datum_fields('phonetic', datum_fields)
+    ls_phonetic_too_long = False
+    if ls_phonetic:
+        if len(ls_phonetic) > 255:
+            ls_phonetic_too_long = True
+            warnings['docspecific'].append('The phonetic value "%s" of datum %s'
+                ' is too long and will be truncated.' % (ls_phonetic, datum_id))
+            old_form['phonetic_transcription'] = ls_phonetic[:255]
+        else:
+            old_form['phonetic_transcription'] = ls_phonetic
+
     # Grammaticality. From LingSync judgement.
     if ls_judgement:
-        old_form['grammaticality'] = ls_judgement
+        # In some LingSync corpora, users added comments into the
+        # grammaticality field. We try to detect and repair that here.
+        if len(ls_judgement) > 3:
+            warnings['general'].append(u'You have some grammaticality values'
+                ' that contain more than three characters, suggesting that'
+                ' these values are comments and not true grammaticalities. We'
+                ' have tried to separate the true grammaticalities from the'
+                ' comments. Search for "Comment from LingSync judgement field:"'
+                ' in the comments field of forms in the resulting OLD database.')
+            grammaticality_prefix = []
+            for char in ls_judgement:
+                if char in (u'*', u'?', u'#', u'!'):
+                    grammaticality_prefix.append(char)
+                else:
+                    break
+            old_form['grammaticality'] = u''.join(grammaticality_prefix)
+            comment = punctuate_period_safe(u'Comment from LingSync judgement'
+                u' field: %s' % ls_judgement)
+            old_comments.append(comment)
+        else:
+            old_form['grammaticality'] = ls_judgement
 
     # Morpheme Gloss. Max 255 chars. From LingSync gloss.
     ls_gloss_too_long = False
@@ -1722,8 +1791,8 @@ def process_lingsync_datum(doc, collections):
     old_form_creation_metadata = []
     if ls_enteredByUser and ls_dateEntered:
         old_form_creation_metadata.append(u'This form was created from LingSync'
-            u' datum %s, which was created by %s on %s.' % (
-            datum_id, ls_enteredByUser, ls_dateEntered))
+            u' datum %s (in corpus %s), which was created by %s on %s.' % (
+            datum_id, lingsync_db_name, ls_enteredByUser, ls_dateEntered))
     if ls_modifiedByUser and ls_dateModified:
         old_form_creation_metadata.append(u'The datum was last modified in'
             u' LingSync by %s on %s.' % (ls_modifiedByUser, ls_dateModified))
@@ -1751,6 +1820,12 @@ def process_lingsync_datum(doc, collections):
         if processed_comments:
             old_comments += processed_comments
 
+    # Datum notes field -> form comments. (Some LingSync corpora have the
+    # non-standard "notes" field in their datums.)
+    ls_notes = get_val_from_datum_fields('notes', datum_fields)
+    if ls_notes:
+        old_comments.append('LingSync notes: %s' % punctuate_period_safe(ls_notes))
+
     # Datum errored fields -> put them (redundantly) into a paragraph in form
     # comments.
     # The datum.syntacticCategory string can't be used to specify the OLD
@@ -1760,21 +1835,25 @@ def process_lingsync_datum(doc, collections):
     ls_syntacticCategory = get_val_from_datum_fields('syntacticCategory',
         datum_fields)
     if ls_utterance_too_long:
-        old_form_errored_data .append(u'LingSync datum utterance value without'
+        old_form_errored_data.append(u'LingSync datum utterance value without'
             u' truncation: \u2018%s\u2019' %
             (punctuate_period_safe(ls_utterance),))
     if ls_morphemes_too_long:
-        old_form_errored_data .append(u'LingSync morphemes value without'
+        old_form_errored_data.append(u'LingSync morphemes value without'
             u' truncation: \u2018%s\u2019' % (
             punctuate_period_safe(ls_morphemes),))
+    if ls_phonetic_too_long:
+        old_form_errored_data.append(u'LingSync phonetic value without'
+            u' truncation: \u2018%s\u2019' % (
+            punctuate_period_safe(ls_phonetic),))
     if ls_gloss_too_long:
-        old_form_errored_data .append(u'LingSync datum gloss value without'
+        old_form_errored_data.append(u'LingSync datum gloss value without'
             u' truncation: \u2018%s\u2019' % punctuate_period_safe(ls_gloss))
     if ls_syntacticCategory:
-        old_form_errored_data .append(u'LingSync syntacticCategory value:'
+        old_form_errored_data.append(u'LingSync syntacticCategory value:'
             u' \u2018%s\u2019' % ( ls_syntacticCategory))
     if ls_syntacticTreeLatex_too_long:
-        old_form_errored_data .append(u'LingSync datum syntacticTreeLatex value'
+        old_form_errored_data.append(u'LingSync datum syntacticTreeLatex value'
             u' without truncation: \u2018%s\u2019' % (
             punctuate_period_safe(ls_syntacticTreeLatex),))
     old_form_errored_data = ' '.join(old_form_errored_data).strip()
@@ -1791,8 +1870,12 @@ def process_lingsync_datum(doc, collections):
     for tag in old_tags:
         auxiliary_resources.setdefault('tags', []).append(tag)
 
-    session_id = ls_session['_id']
-    old_form['__lingsync_session_id'] = session_id
+    if ls_session:
+        session_id = ls_session['_id']
+        old_form['__lingsync_session_id'] = session_id
+    else:
+        print '%sWarning: no LingSync session for datum %s.%s' % (
+            ANSI_WARNING, datum_id, ANSI_ENDC)
     old_form['__lingsync_datum_id'] = datum_id
     oldobj['old_value'] = old_form
     oldobj['old_auxiliary_resources'] = auxiliary_resources
@@ -2342,7 +2425,7 @@ def download(options, lingsync_config, lingsync_db_name):
 
     print '\n%sStep 1. Download the LingSync data.%s' % (ANSI_HEADER, ANSI_ENDC)
     if options.force_download:
-        print 'Downloading the LingSync data.'
+        flush('Downloading the LingSync data...')
         lingsync_data_fname = download_lingsync_json(lingsync_config,
             lingsync_db_name)
     else:
@@ -2369,7 +2452,7 @@ def convert(options, lingsync_data_fname, lingsync_db_name):
     print ('\n%sStep 2. Convert the LingSync data to an OLD-compatible'
         u' structure.%s' % (ANSI_HEADER, ANSI_ENDC))
     if options.force_convert:
-        print 'Converting the LingSync data to an OLD-compatible format.'
+        flush('Converting the LingSync data to an OLD-compatible format...')
         old_data_fname = lingsync2old(lingsync_data_fname, lingsync_db_name,
             options.force_file_download)
     else:
@@ -2426,8 +2509,9 @@ def create_old_application_settings(old_data, c):
         assert r['object_language_name'] == appsett['object_language_name']
         print 'Created the OLD application settings.'
     except:
+        print r
         sys.exit(u'%sSomething went wrong when attempting to create an OLD'
-            u' application settings using the LingSync data. Aborting.' % (
+            u' application settings using the LingSync data. Aborting.%s' % (
             ANSI_FAIL, ANSI_ENDC))
 
 
@@ -2561,7 +2645,7 @@ def create_old_collections(old_data, c, old_url, relational_map):
     resources_created = []
 
     if old_data.get('collections'):
-        print 'Creating OLD collections.',
+        flush('Creating OLD collections...')
         relational_map.setdefault('collections', {})
 
         # Get the "migration tag" id.
@@ -2618,7 +2702,7 @@ def create_old_collections(old_data, c, old_url, relational_map):
             contents = []
             for form in old_data.get('forms', []):
                 if not form.get('__lingsync_deleted'):
-                    form_s_id = form['__lingsync_session_id']
+                    form_s_id = form.get('__lingsync_session_id')
                     form_d_id = form['__lingsync_datum_id']
                     if form_s_id == session_id:
                         form_id = relational_map.get('forms', {}).get(form_d_id)
@@ -2659,7 +2743,7 @@ def create_old_corpora(old_data, c, old_url, relational_map):
     resources_created = []
 
     if old_data.get('corpora'):
-        print 'Creating OLD corpora.',
+        flush('Creating OLD corpora...')
         relational_map.setdefault('corpora', {})
 
         # Get the "migration tag" id.
@@ -2732,7 +2816,7 @@ def create_old_forms(old_data, c, old_url, relational_map):
     }
 
     if old_data.get('forms'):
-        print 'Creating OLD forms.',
+        flush('Creating OLD forms...')
         relational_map.setdefault('forms', {})
 
         # Get the "migration tag" id.
@@ -2799,7 +2883,12 @@ def create_old_forms(old_data, c, old_url, relational_map):
 
             # Create the form on the OLD
             form['tags'].append(migration_tag_id)
-            r = c.create('forms', form)
+            try:
+                r = c.create('forms', form)
+            except requests.exceptions.SSLError:
+                print ('%sWarning: SSLError; probably'
+                    ' CERTIFICATE_VERIFY_FAILED.%s' % (ANSI_WARNING, ANSI_ENDC))
+                r = c.create('forms', form, False)
             try:
                 assert r.get('id')
                 resources_created['created'].append(r['id'])
@@ -2839,7 +2928,7 @@ def create_old_files(old_data, c, old_url, relational_map):
 
     if old_data.get('files'):
         relational_map.setdefault('files', {})
-        print 'Creating OLD files.',
+        flush('Creating OLD files...')
 
         # Issue the create (POST) requests.
         for file in old_data['files']:
@@ -2908,7 +2997,7 @@ def create_old_tags(old_data, c, old_url, lingsync_corpus_name, relational_map):
     resources_created = []
 
     relational_map.setdefault('tags', {})
-    print 'Creating OLD tags.',
+    flush('Creating OLD tags...')
 
     # Create a tag for this migration
     global migration_tag_name
@@ -2980,7 +3069,7 @@ def create_old_speakers(old_data, c, old_url, relational_map):
     }
 
     if old_data.get('speakers'):
-        print 'Creating OLD speakers.',
+        flush('Creating OLD speakers...')
         relational_map.setdefault('speakers', {})
         speakers_to_create = []
         speakers_to_update = []
@@ -3074,7 +3163,7 @@ def create_old_users(old_data, c, old_url, relational_map):
     }
 
     if old_data.get('users'):
-        print 'Creating OLD users.',
+        flush('Creating OLD users...')
         relational_map.setdefault('users', {})
         users_to_create = []
         users_to_update = []

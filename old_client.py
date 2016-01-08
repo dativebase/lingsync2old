@@ -78,8 +78,6 @@ class OLDClient(object):
         payload = json.dumps({'username': username, 'password': password})
         response = self.session.post('%s/login/authenticate' % self.url,
             data=payload)
-        print '%s/login/authenticate' % self.url
-        print response.text
         return response.json().get('authenticated', False)
 
     def get(self, path, params=None, verbose=True):
@@ -87,9 +85,9 @@ class OLDClient(object):
             params=params)
         return self.return_response(response, verbose=verbose)
 
-    def post(self, path, data=json.dumps({})):
+    def post(self, path, data=json.dumps({}), verify=True):
         response = self.session.post('%s/%s' % (self.url, path),
-            data=json.dumps(data))
+            data=json.dumps(data), verify=verify)
         return self.return_response(response)
 
     create = post
