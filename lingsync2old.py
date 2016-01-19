@@ -1788,6 +1788,13 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     ls_modifiedByUser = get_val_from_datum_fields('modifiedByUser', datum_fields)
     ls_dateModified = doc.get('dateModified')
     ls_dateEntered = doc.get('dateEntered')
+    # We remember the date entered so that we can get the correct sort order for
+    # forms in collections (since datums are sorted in their sessions according
+    # to date entered).
+    if ls_dateEntered:
+        old_form['date_entered'] = ls_dateEntered
+    else:
+        print '%sWarning: no date entered value.%s' % (ANSI_WARNING, ANSI_ENDC)
     old_form_creation_metadata = []
     if ls_enteredByUser and ls_dateEntered:
         old_form_creation_metadata.append(u'This form was created from LingSync'
@@ -2699,6 +2706,9 @@ def create_old_collections(old_data, c, old_url, relational_map):
                         u' "%s".%s' % (ANSI_WARNING, key, ANSI_ENDC))
 
             # Get the `contents` value as a bunch of references to form ids.
+            # TODO: something is going wrong here. Some OLD collections are
+            # being created without any forms in them even though the LingSync
+            # sessions that they are derived from do have datums in them.
             contents = []
             for form in old_data.get('forms', []):
                 if not form.get('__lingsync_deleted'):
@@ -2707,14 +2717,17 @@ def create_old_collections(old_data, c, old_url, relational_map):
                     if form_s_id == session_id:
                         form_id = relational_map.get('forms', {}).get(form_d_id)
                         if form_id:
-                            contents.append(form_id)
+                            contents.append((form['date_entered'], form_id))
                         else:
                             print (u'%sWarning: unable to find id for OLD form'
                                 u' generated from LingSync datum %s.%s' % (
                                 ANSI_WARNING, form['__lingsync_datum_id'],
                                 ANSI_ENDC))
-            collection['contents'] = u'\n'.join([u'form[%d]' % i for i in
-                contents])
+            if not contents:
+                print '%sWARNING: collection "%s" has no contents.%s' % (
+                    ANSI_WARNING, collection['title'], ANSI_ENDC)
+            collection['contents'] = u'\n'.join([u'form[%d]' % t[1] for t in
+                sorted(contents)])
 
             # Create the collection on the OLD
             collection['tags'].append(migration_tag_id)
