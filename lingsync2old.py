@@ -134,6 +134,7 @@ TODOs
 from fielddb_client import FieldDBClient
 from old_client import OLDClient
 import requests
+import string
 import json
 import optparse
 import getpass
@@ -148,6 +149,7 @@ import urlparse
 import base64
 import mimetypes
 import codecs
+import random
 
 p = pprint.pprint
 
@@ -178,6 +180,19 @@ ANSI_UNDERLINE = '\033[4m'
 
 migration_tag_name = None
 
+# WARNING: this should be set to `False`. However, when debugging the script,
+# setting it to `True` will prevent the accumulation of conversion warnings so
+# you can focus on those that you want to.
+QUIET = False
+
+# This accumulates the lengths of the field values that overflow the maximum
+# length allowed by the OLD. This gives the user a rough idea of how many
+# values were too long and what their lengths were.
+OVERFLOWS = set()
+
+# Global used to accumulated original tags and the datum ids that reference
+# them so that they can be fixed later ...
+TAGSTOFIX = {}
 
 def flush(string):
     """Print `string` immediately, and with no carriage return.
@@ -355,12 +370,12 @@ old_schemata = {
     },
 
     'form': {
-        'transcription': u'', # = ValidOrthographicTranscription(not_empty=True, max=255)
-        'phonetic_transcription': u'', # = ValidBroadPhoneticTranscription(max=255)
-        'narrow_phonetic_transcription': u'', # = ValidNarrowPhoneticTranscription(max=255)
-        'morpheme_break': u'', # = ValidMorphemeBreakTranscription(max=255)
+        'transcription': u'', # = ValidOrthographicTranscription(max=510)
+        'phonetic_transcription': u'', # = ValidBroadPhoneticTranscription(max=510)
+        'narrow_phonetic_transcription': u'', # = ValidNarrowPhoneticTranscription(max=510)
+        'morpheme_break': u'', # = ValidMorphemeBreakTranscription(max=510)
         'grammaticality': u'', # = ValidGrammaticality(if_empty='')
-        'morpheme_gloss': u'', # = UnicodeString(max=255)
+        'morpheme_gloss': u'', # = UnicodeString(max=510)
         'translations': [], # = ValidTranslations(not_empty=True)
         'comments': u'', # = UnicodeString()
         'speaker_comments': u'', # = UnicodeString()
@@ -1099,9 +1114,12 @@ def process_lingsync_comments_val(ls_comments, warnings):
                     punctuate_period_safe(comment_obj['text']))
                 comments_to_return.append(comment_)
             else:
-                warnings['docspecific'].append(u'Unable to process the following comment (from'
-                    u' of datum %s): \u2018%s\u2019' % (datum_id,
-                    unicode(comment_obj)))
+                # An comment whose text value is just an empty string is just
+                # ignored.
+                if comment_obj.get('text').strip() != u'':
+                    warnings['docspecific'].append(u'Unable to process the'
+                        ' following comment: \u2018%s\u2019' % (
+                        unicode(comment_obj)))
     else:
         if (type(ls_comments) is type('')) or (type(ls_comments) is type(u'')):
             if ls_comments.strip():
@@ -1142,7 +1160,9 @@ def process_lingsync_datalist(doc):
         'description', # u'This is the result of searching for : morphemes:#nit- In Blackfoot on Sun Nov 09 2014 18:29:24 GMT-0800 (PST)',
         'pouchname',
         'timestamp', # 1415586565309,
-        'title' # u'All Data as of Sun Nov 09 2014 18:29:25 GMT-0800 (PST)'}
+        'title', # u'All Data as of Sun Nov 09 2014 18:29:25 GMT-0800 (PST)'}
+        'trashed', # ignoring this attribute; only value I've seen is "deleted1428640331225" ...
+        'dbname' # Same as pouchname above, it's the name of the LingSync corpus.
     ]
 
     # Add warnings to this.
@@ -1150,7 +1170,6 @@ def process_lingsync_datalist(doc):
         'general': [],
         'docspecific': []
     }
-
 
     for k in doc:
         if k not in known_attrs:
@@ -1270,7 +1289,11 @@ def process_lingsync_user(doc):
         'researchInterest',
         'email',
         'subtitle',
-        'affiliation'
+        'affiliation',
+        # Ignoring the following:
+        'api',
+        'fieldDBtype',
+        'version'
     ]
 
     # Add warnings to this.
@@ -1343,6 +1366,12 @@ def process_lingsync_user(doc):
     else:
         old_user = None
 
+    # Sometimes, the value of a LingSync user's username is itself an object,
+    # so we turn it into a string here.
+    old_user['username'] = fix_user_name(old_user['username'])
+    old_user['first_name'] = fix_user_name(old_user['first_name'])
+    old_user['last_name'] = fix_user_name(old_user['last_name'])
+
     oldobj['old_value'] = old_user
     oldobj['old_auxiliary_resources'] = auxiliary_resources
     oldobj['warnings'] = warnings
@@ -1366,9 +1395,12 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     known_fields = [
         'judgement',
         'morphemes',
+        'allomorphs', # gina-nuktitut uses this and it is sometimes different from 'morphemes'?
         'utterance',
         'gloss',
         'translation',
+        'another_translation', # in gina-inuktitut
+        'context_translation', # in gina-inuktitut
         'validationStatus',
         'tags',
         'syntacticCategory',
@@ -1379,7 +1411,29 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         'markAsNeedsToBeSaved', # Ignoring this. Strangely, there can be multiple fields with this label in a datimFields array ...
         'checked', # Ignoring this. It can evaluate to `true`, but and may be relevant to `validationStatus` and the OLD form's `status`, but I think it's safe to ignore it.
         'notes', # non-standard but attested
-        'phonetic' # non-standard but attested
+        'phonetic', # non-standard but attested
+        'itemNumber', # added to comments field, when content-ful
+        'speaker', # added to OLD form.speaker (and possibly also comments field)
+        'context', # added to comments field, when content-ful
+        'documentation', # Never seen this not empty, so ignoring it for now.
+        'links', # added to comments field, when content-ful
+        'audio', # Name of .wav audio file, but don't know how to get URL (TODO)
+        'contextFile', # Name of .wav audio file, but don't know how to get URL (TODO)
+        'consultant', # Ignoring this for now, it's just a string of digits, e.g., '1' or '15'
+        'contextTranslation', # Adding this to OLD form's translations list
+        'housekeeping', # This field appears to always be empty ...
+        'orthography', # This field appears to always be empty ...
+        'spanish', # This field appears to always be empty ...
+        'consultants', # This field appears to always be empty ...
+        'dataelicited', # This field appears to always be empty ...
+        'dialect', # This field appears to always be empty ...
+        'judgment', # This trumps the standard "judgement" field (see above).
+        'language', # This field appears to always be empty ...
+        'morpheme', # This field trumps the standard "morphemes" field (see above).
+        'undefined', # Ignorable: never has a real value; only values ever seen are sequences of question marks.
+        'chapter', # Used in gina-inuktitut for chapter of Genesis.
+        'dateSEntered', # Timestamp that is ignored.
+        'verse' # Used in gina-inuktitut for verse of Genesis.
     ]
 
     known_attrs = [
@@ -1402,7 +1456,15 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         'dateCreated', # Unix timestamp; Is this different value from `dateEntered`? Doesn't really matter for this migration script.
         'dbname', # Ignorable
         'fieldDBtype', # Ignorable
-        'version' # Ignorable
+        'version', # Ignorable
+
+        'datumStates', # Ignoring this. It's only found in gina-inuktitut.
+
+        'lastModifiedBy', # This is ignored because you can't write modifiers to OLD forms, only the OLD does that, server-side.
+        'enteredByUser', # This attribute appears to be redundant, given the enteredByUser-labelled field (see above). Ignoring.
+        '_attachments', # May contain references to audio files, but I don't know how to get their URLs. TODO.
+        'attachmentInfo' # Ignorable: never has a real value.
+
     ]
 
     # Fill this with OLD resources that are implicit in the LingSync datum.
@@ -1419,7 +1481,7 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
             warnings['docspecific'].append(u'\u2018%s\u2019 not a recognized'
                 u' attribute in datum %s' % (k, datum_id))
     for obj in datum_fields:
-        if obj['label'] not in known_fields:
+        if obj['label'] and obj['label'] not in known_fields:
             warnings['docspecific'].append(u'\u2018%s\u2019 not a recognized'
                 u' label in fields for datum %s' % (obj['label'], datum_id))
 
@@ -1442,6 +1504,32 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     # ultimately.
     old_comments = []
 
+    # Some datums have an `itemNumber` field.
+    ls_itemNumber = get_val_from_datum_fields('itemNumber', datum_fields)
+    if ls_itemNumber:
+        old_comments.append('Item number: %s' % (
+            punctuate_period_safe(ls_itemNumber),))
+
+    # Some datums have a `context` field.
+    ls_context = get_val_from_datum_fields('context', datum_fields)
+    if ls_context:
+        old_comments.append('Context: %s' % (
+            punctuate_period_safe(ls_context),))
+
+    # Some datums have a `links` field, which contains references to other
+    # datums.
+    # The `links` field appears to consistently be a string of comma-separated
+    # expressions of the form "similarTo:4f868ba9a79e57479ddbe4f62ae671c8"
+    # where the string after the colon is a datum id. That datum id should be
+    # transformed into a form id, if possible.
+    # TODO: post-process links; i.e., once the forms have been entered, update
+    # those with links so that the links reference the ids of the corresponding
+    # forms in the new OLD.
+    ls_links = get_val_from_datum_fields('links', datum_fields)
+    if ls_links:
+        old_comments.append('Links: %s' % (
+            punctuate_period_safe(ls_links),))
+
     # Certain LingSync values may also be made into tags.
     old_tags = []
 
@@ -1453,14 +1541,31 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     # These values (from LingSync datum fields) are used elsewhere.
     ls_judgement = get_val_from_datum_fields('judgement', datum_fields)
     ls_morphemes = get_val_from_datum_fields('morphemes', datum_fields)
+    ls_allomorphs = get_val_from_datum_fields('allomorphs', datum_fields)
     ls_utterance = get_val_from_datum_fields('utterance', datum_fields)
     ls_gloss = get_val_from_datum_fields('gloss', datum_fields)
     ls_translation = get_val_from_datum_fields('translation', datum_fields)
+    ls_another_translation = get_val_from_datum_fields('another_translation',
+            datum_fields)
+    ls_context_translation = get_val_from_datum_fields('context_translation',
+            datum_fields)
     ls_validationStatus = get_val_from_datum_fields('validationStatus', datum_fields)
     ls_tags = get_val_from_datum_fields('tags', datum_fields)
     ls_syntacticTreeLatex = get_val_from_datum_fields('syntacticTreeLatex', datum_fields)
+    ls_chapter = get_val_from_datum_fields('chapter', datum_fields)
+    ls_verse = get_val_from_datum_fields('verse', datum_fields)
     ls_datumTags = doc.get('datumTags')
     ls_session = doc.get('session')
+
+    ls_datumStates = doc.get('datumStates')
+    if ls_datumStates:
+        print 'datumStates: %s\n' % ls_datumStates
+
+    # Some datums have a 'documentation' field; however, I have yet to see such
+    # a field whose value was not the empty string.
+    ls_documentation = get_val_from_datum_fields('documentation', datum_fields)
+    if ls_documentation:
+        print '\n\ndocumentation in datum; value is "%s".\n\n' % ls_documentation
 
     # Date Elicited. Date in 'MM/DD/YYYY' format. From
     # datum.session.sessionFields.dateElicited.
@@ -1483,9 +1588,10 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
                 except Exception, e:
                     datetime_inst = None
                     date_datum_elicited_unparseable = True
-                    warnings['docspecific'].append(u'Unable to parse %s to an OLD-compatible date'
-                        u' in MM/DD/YYYY format for datum %s.' % (
-                        date_session_elicited, datum_id))
+                    if date_session_elicited != 'none' and not QUIET:
+                        warnings['docspecific'].append(u'Unable to parse %s to an OLD-compatible date'
+                            u' in MM/DD/YYYY format for datum %s.' % (
+                            date_session_elicited, datum_id))
             if datetime_inst:
                 y = datetime_inst.year
                 m = datetime_inst.month
@@ -1496,6 +1602,37 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
                 date_elicited = None
             if date_elicited:
                 old_form['date_elicited'] = date_elicited
+
+    # TODO: this datum field ("audio") can sometimes name an audio file.
+    # However, I have not been able to discover how to get my hands on the URL of
+    # that file.
+    ls_audio = get_val_from_datum_fields('audio', datum_fields)
+    # if ls_audio:
+    #     print '\naudio field:'
+    #     pprint.pprint(ls_audio)
+    #     print
+
+    # TODO: this datum field ("contextFile") can sometimes also name an audio
+    # file. As with the "audio" field mentioned above, I have not been able to
+    # discover how to get my hands on the URL of that file. Note, these are all
+    # .wav file names.
+    ls_contextFile = get_val_from_datum_fields('contextFile', datum_fields)
+    if ls_contextFile and ls_contextFile != 'contextFile' and ('.wav' not in ls_contextFile):
+        print '\ncontextFile field:'
+        pprint.pprint(ls_contextFile)
+        print
+
+    # TODO: this datum attribute ("_attachments") can sometimes also name an audio file, of sorts.
+    ls_attachments = doc.get('_attachments')
+    # The only value I have seen is this object:
+    # {
+    #     u'1398457871136.wav': {u'stub': True, u'length': 81964,
+    #         u'content_type': u'audio/wav', u'revpos': 2, u'digest':
+    #         u'md5-vl3deBSesSf4uWsn6Ctf5g=='},
+    #     u'1398457871477.wav': {u'stub': True, u'length': 81964,
+    #         u'content_type': u'audio/wav', u'revpos': 3, u'digest':
+    #         u'md5-vl3deBSesSf4uWsn6Ctf5g=='}
+    # }
 
     # Files. Array of OLD file objects. The `audioVideo` attribute holds an
     # array of objects, each of which has 'URL' and 'type' attributes. The
@@ -1556,6 +1693,15 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     # Tags. [] or a list of OLD tags.
     if ls_tags:
         if type(ls_tags) is type(u''):
+
+            # print (u'Processing datum field "tags" %s by splitting it into these'
+            #     ' %d tags: "%s"' % (ls_tags, len(ls_tags.split()),
+            #     ', '.join(ls_tags.split())))
+            global TAGSTOFIX
+            TAGSTOFIX.setdefault(ls_tags, {})
+            TAGSTOFIX[ls_tags].setdefault('datum_ids', []).append(datum_id)
+            TAGSTOFIX[ls_tags]['tags_created'] = ls_tags.split()
+
             for tag in ls_tags.split():
                 old_tag = copy.deepcopy(old_schemata['tag'])
                 old_tag['name'] = tag
@@ -1569,14 +1715,25 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
             for tag in ls_datumTags:
                 if type(tag) is type({}):
                     if tag.get('tag'):
+
+                        # print ('Processing datum attribute "datumTags" and'
+                        #     ' getting tag named %s' % tag['tag'])
+
+                        global TAGSTOFIX
+                        TAGSTOFIX.setdefault(tag['tag'], {})
+                        TAGSTOFIX[tag['tag']].setdefault('datum_ids', []).append(datum_id)
+                        TAGSTOFIX[tag['tag']]['tags_created'] = [tag['tag']]
+
                         old_tag = copy.deepcopy(old_schemata['tag'])
                         old_tag['name'] = tag['tag']
                         old_tags.append(old_tag)
                     else:
-                        warnings['docspecific'].append(u'Tag object \u2018%s\u2019'
-                            u' from datum.datumTags of datum %s has no `tag`'
-                            u' attribute and cannot be used.' % (
-                            unicode(tag), datum_id))
+                        if not QUIET:
+                            warnings['docspecific'].append(u'Tag object \u2018%s\u2019'
+                                u' from datum.datumTags of datum %s has no `tag`'
+                                u' attribute and cannot be used.' % (
+                                unicode(tag), datum_id))
+
                 else:
                     warnings['docspecific'].append(u'Unable to use tag \u2018%s\u2019'
                         u' from datum.datumTags of datum %s' %
@@ -1591,10 +1748,29 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     ls_trashed = doc.get('trashed')
     if ls_trashed == 'deleted':
         old_form['__lingsync_deleted'] = True
+    # TODO: do these validation statuses really mean the datum has been
+    # deleted? WAITING FOR gina.
+    if ls_validationStatus and ls_validationStatus in ['Deleted', 'Deleted, Checked']:
+        old_form['__lingsync_deleted'] = True
+
+    # TODO: some datums have a field labelled "consultant". However, from what
+    # I have seen, the value of this field is just a string containing digits,
+    # like '1' or '15' so I am ignoring it for now.
+    ls_consultant = get_val_from_datum_fields('consultant', datum_fields)
+    if ls_consultant:
+        non_digits = []
+        for ch in ls_consultant:
+            if ch not in '0123456789':
+                non_digits.append(ch)
+        if non_digits and ls_consultant != 'participant':
+            print '\nconsultant field:'
+            pprint.pprint(ls_consultant)
+            print
 
     # Speaker. Null or a valid speaker resource. From datum.session.consultants.
     # WARNING: it's not practical to try to perfectly parse free-form
     # consultants values.
+
 
     speakers = []
     if ls_session:
@@ -1633,16 +1809,27 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
                         old_speaker['dialect'] = dialect
                     speakers.append(old_speaker)
 
+    # Aside from the datum's session's consultants field, some datums can have
+    # a 'speaker' field. This speaker value seems to consistently be a
+    # one-character string.
+    ls_speaker = get_val_from_datum_fields('speaker', datum_fields)
+    if ls_speaker:
+        old_speaker = copy.deepcopy(old_schemata['speaker'])
+        old_speaker['first_name'] = ls_speaker
+        old_speaker['last_name'] = ls_speaker
+        speakers.append(old_speaker)
+
     if len(speakers) >= 1:
         old_form['speaker'] = speakers[0]
         if len(speakers) > 1:
-            warnings['docspecific'].append('Datum %s has more than one'
-                ' consultant listed. Since OLD forms only allow one speaker, we'
-                ' are just going to associate the first speaker to the OLD form'
-                ' created form this LingSync datum. The additional LingSync'
-                ' speakers will still be created as OLD speakers, however, and'
-                ' ALL LingSync consultants will be documented in the form\'s'
-                ' comments field.' % datum_id)
+            if not QUIET:
+                warnings['docspecific'].append('Datum %s has more than one'
+                    ' consultant listed. Since OLD forms only allow one speaker, we'
+                    ' are just going to associate the first speaker to the OLD form'
+                    ' created form this LingSync datum. The additional LingSync'
+                    ' speakers will still be created as OLD speakers, however, and'
+                    ' ALL LingSync consultants will be documented in the form\'s'
+                    ' comments field.' % datum_id)
             speaker_strs = [u'%s %s' % (s['first_name'], s['last_name']) for s
                 in speakers]
             old_comments.append(punctuate_period_safe(
@@ -1658,9 +1845,9 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
             u' datum.session.enteredByUser values. This may be inaccurate. Change'
             u' as needed in the Dative/OLD interface.')
         old_elicitor = copy.deepcopy(old_schemata['user'])
-        old_elicitor['username'] = ls_enteredByUser
-        old_elicitor['first_name'] = ls_enteredByUser
-        old_elicitor['last_name'] = ls_enteredByUser
+        old_elicitor['username'] = fix_user_name(ls_enteredByUser)
+        old_elicitor['first_name'] = fix_user_name(ls_enteredByUser)
+        old_elicitor['last_name'] = fix_user_name(ls_enteredByUser)
         warnings['general'].append(u'Created a user (with username %s) with a'
             u' fake email: %s. Please fix manually, i.e., from within the'
             u' Dative/OLD interface.' % (ls_enteredByUser, FAKE_EMAIL))
@@ -1670,55 +1857,98 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         auxiliary_resources.setdefault('users', []).append(old_elicitor)
 
     # Status. Must be 'tested' or 'requires testing'. LingSync's
-    # validationStatus is similar. A common value is 'Checked'. It's not
-    # clear which validationStatus values should cause OLD's `status` to be
-    # 'requires testing'. Testing with more LingSync corpora is needed.
+    # validationStatus is similar. A common value is 'Checked'. The LingSync
+    # value 'toBeChecked' is taken here to mean that the OLD's value should be
+    # 'requires testing'.
+    # We ignore the validation status 'Deleted' here and use it later on to
+    # mark the form/datum as deleted.j
+    # TODO: does validationStatus=Deleted mean that the datum has been deleted?
+    # Ask Gina.
     if ls_validationStatus:
-        if ls_validationStatus != 'Checked':
-            old_tags.append(u'validation status: %s' % ls_validationStatus)
-            warnings['docspecific'].append(u'Unrecognized validationStatus \u2018%s\u2019 in'
-                u' datum %s' % ( ls_validationStatus, datum_id))
+        if ls_validationStatus == 'toBeChecked':
+            old_form['status'] = 'requires testing'
+        elif ls_validationStatus not in ['Checked', 'Deleted', 'Deleted, Checked']:
+            old_tags.append({
+                'name': u'validation status: %s' % ls_validationStatus,
+                'description': u''
+            })
+            """
+            Commenting this out for now: it's saved in comments field anyway.
+            warnings['docspecific'].append(u'Unrecognized validationStatus'
+                u' \u2018%s\u2019 in datum %s' % (ls_validationStatus,
+                    datum_id))
+            """
 
-    # Transcription. Not empty, max 255 chars. From LingSync utterance.
+    # Transcription. Not empty, max 510 chars. From LingSync utterance.
     ls_utterance_too_long = False
     if not ls_utterance:
         old_transcription = u'PLACEHOLDER'
         # warnings['docspecific'].append(u'Datum %s has no utterance value; the form generated'
         #     ' from it has "PLACEHOLDER" as its transcription value.' % datum_id)
-    elif len(ls_utterance) > 255:
+    elif len(ls_utterance) > 510:
         ls_utterance_too_long = True
-        warnings['docspecific'].append('The utterance "%s" of datum %s is too long and will be'
-            ' truncated.' % (ls_utterance, datum_id))
-        old_transcription = ls_utterance[:255]
+        if not QUIET:
+            OVERFLOWS.add(len(ls_utterance))
+            warnings['docspecific'].append('The utterance "%s" of datum %s is too long (%d chars) and will be'
+                ' truncated.' % (ls_utterance, datum_id, len(ls_utterance)))
+        old_transcription = ls_utterance[:510]
     else:
         old_transcription = ls_utterance
     old_form['transcription'] = old_transcription
 
-    # Morpheme Break. Max 255 chars. From LingSync morphemes.
+    # Morpheme Break. Max 510 chars. From LingSync morphemes.
     ls_morphemes_too_long = False
+
+    # The idiosyncratic "morpheme" field trumps the standard "morpheme" one.
+    # I've only seen this field rarely, but when it is present it appears to
+    # contain more information than the "morphemes", hence the trump.
+    ls_morpheme = get_val_from_datum_fields('morpheme', datum_fields)
+    if ls_morpheme:
+        ls_morphemes = ls_morpheme
+
     if ls_morphemes:
-        if len(ls_morphemes) > 255:
+        if len(ls_morphemes) > 510:
             ls_morphemes_too_long = True
-            warnings['docspecific'].append('The morphemes "%s" of datum %s is too long and'
-                ' will be truncated.' % (ls_morphemes, datum_id))
-            old_form['morpheme_break'] = ls_morphemes[:255]
+            if not QUIET:
+                OVERFLOWS.add(len(ls_morphemes))
+                warnings['docspecific'].append('The morphemes "%s" of datum %s is too long and'
+                    ' will be truncated.' % (ls_morphemes, datum_id))
+            old_form['morpheme_break'] = ls_morphemes[:510]
         else:
             old_form['morpheme_break'] = ls_morphemes
 
-    # Phonetic Transcription. Max 255 chars. From the non-standard LingSync
+    # If we have allomorphs and they are different from our morphemes, then put
+    # them in the comments field.
+    if ls_allomorphs and ls_allomorphs != ls_morphemes:
+        old_comments.append(u'Allomorphs: \u201c%s\u201d' % (
+            punctuate_period_safe(ls_allomorphs)))
+
+    # Phonetic Transcription. Max 510 chars. From the non-standard LingSync
     # field "phonetic".
     ls_phonetic = get_val_from_datum_fields('phonetic', datum_fields)
     ls_phonetic_too_long = False
     if ls_phonetic:
-        if len(ls_phonetic) > 255:
+        if len(ls_phonetic) > 510:
             ls_phonetic_too_long = True
-            warnings['docspecific'].append('The phonetic value "%s" of datum %s'
-                ' is too long and will be truncated.' % (ls_phonetic, datum_id))
-            old_form['phonetic_transcription'] = ls_phonetic[:255]
+            if not QUIET:
+                OVERFLOWS.add(len(ls_phonetic))
+                warnings['docspecific'].append('The phonetic value "%s" of datum %s'
+                    ' is too long and will be truncated.' % (ls_phonetic, datum_id))
+            old_form['phonetic_transcription'] = ls_phonetic[:510]
         else:
             old_form['phonetic_transcription'] = ls_phonetic
 
-    # Grammaticality. From LingSync judgement.
+
+    # Grammaticality. From LingSync judgement (or from LingSync judgment, note spelling)
+
+    # The LingSync field named "judgment" is non-standard. However, in the
+    # migrations I have made, it appears to contain roughly the same
+    # information as "judgement", only better formatted. Therefore, if judgment
+    # exists, we use it instead of judgement.
+    ls_judgment = get_val_from_datum_fields('judgment', datum_fields)
+    if ls_judgment:
+        ls_judgement = ls_judgment
+
     if ls_judgement:
         # In some LingSync corpora, users added comments into the
         # grammaticality field. We try to detect and repair that here.
@@ -1742,38 +1972,71 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         else:
             old_form['grammaticality'] = ls_judgement
 
-    # Morpheme Gloss. Max 255 chars. From LingSync gloss.
+    # Morpheme Gloss. Max 510 chars. From LingSync gloss.
     ls_gloss_too_long = False
     if ls_gloss:
-        if len(ls_gloss) > 255:
+        if len(ls_gloss) > 510:
             ls_gloss_too_long = True
-            warnings['docspecific'].append('The gloss "%s" of datum %s is too long and'
-                ' will be truncated.' % (ls_gloss, datum_id))
-            old_form['morpheme_gloss'] = ls_gloss[:255]
+            if not QUIET:
+                OVERFLOWS.add(len(ls_gloss))
+                warnings['docspecific'].append('The gloss "%s" of datum %s is too long and'
+                    ' will be truncated.' % (ls_gloss, datum_id))
+            old_form['morpheme_gloss'] = ls_gloss[:510]
         else:
             old_form['morpheme_gloss'] = ls_gloss
 
-    # Translations. Has to be at least one. From LingSync translation.
+
+    # Translations. Has to be at least one. From LingSync translation. Also
+    # potentially from LingSync "contextTranslation".
+    translations = []
     if ls_translation:
-        old_translation_transcription = ls_translation
+        # old_translation_transcription = ls_translation
+        translations.append(ls_translation)
+
+    # "contextTranslation", an idiosyncratic field. TODO: does this belong in
+    # OLD translations?
+    ls_contextTranslation = get_val_from_datum_fields('contextTranslation', datum_fields)
+    if ls_contextTranslation:
+        translations.append(ls_contextTranslation)
+
+    if ls_another_translation:
+        translations.append(ls_another_translation)
+
+    # This is another "context translation". This is how it's spelt in
+    # gina-inuktitut.
+    if ls_context_translation:
+        translations.append(ls_context_translation)
+        old_comments.append(u'Context translation: \u201c%s\u201d' % (
+            punctuate_period_safe(ls_context_translation)))
+
+    if len(translations) == 0:
+        old_form['translations'] = [{
+            'transcription': u'PLACEHOLDER',
+            'grammaticality': u''
+        }]
     else:
-        old_translation_transcription = u'PLACEHOLDER'
-        # warnings['docspecific'].append(u'Datum %s has no translation value; the form generated'
-        #     ' from it has "PLACEHOLDER" as its translation transcription'
-        #     ' value.' % datum_id)
-    old_form['translations'] = [{
-        'transcription': old_translation_transcription,
-        'grammaticality': u''
-    }]
+        old_form['translations'] = []
+        for t in translations:
+            old_form['translations'].append({
+                'transcription': t,
+                'grammaticality': u''
+            })
+
+    # Chapter and verse. Only used in gina-inuktitut, a Genesis translation.
+    if ls_chapter:
+        old_comments.append(u'Chapter %s' % punctuate_period_safe(ls_chapter))
+    if ls_verse:
+        old_comments.append(u'Verse %s' % punctuate_period_safe(ls_verse))
 
     # Syntax. Max 1023 chars. From LingSync syntacticTreeLatex.
     ls_syntacticTreeLatex_too_long = False
     if ls_syntacticTreeLatex:
         if len(ls_syntacticTreeLatex) > 1023:
             ls_syntacticTreeLatex_too_long = True
-            warnings['docspecific'].append('The syntacticTreeLatex "%s" of datum %s is too'
-                ' long and will be truncated.' % (ls_syntacticTreeLatex, datum_id))
-            old_form['syntax'] = ls_syntacticTreeLatex[:255]
+            if not QUIET:
+                warnings['docspecific'].append('The syntacticTreeLatex "%s" of datum %s is too'
+                    ' long and will be truncated.' % (ls_syntacticTreeLatex, datum_id))
+            old_form['syntax'] = ls_syntacticTreeLatex[:1023]
         else:
             old_form['syntax'] = ls_syntacticTreeLatex
 
@@ -1965,7 +2228,14 @@ def process_lingsync_session(doc):
         'dateSEntered',
         'participants', # Sometimes a field with this label. I'm ignoring it. It seems to consitently be an empty string.
         'DateSessionEntered', # Sometimes a field with this label. I'm ignoring it. It seems to consistently be an empty string.
-        'dateSessionEntered' # Sometimes a field with this label. I'm ignoring it. It seems to be the same date as the date_created datetime, just in a different format.
+        'dateSessionEntered', # Sometimes a field with this label. I'm ignoring it. It seems to be the same date as the date_created datetime, just in a different format.
+        # The following idiosyncratic session fields have never been observed with values, so they are being ignored.
+        'annotationDate', # I've never seen this field with a value, so I'm ignoring it for now.
+        'annotationsFundedBy', # I've never seen this field with a value, so I'm ignoring it for now.
+        'attributionInfo', # I've never seen this field with a value, so I'm ignoring it for now.
+        'collection', # I've never seen this field with a value, so I'm ignoring it for now.
+        'originalTranscriber', # I've never seen this field with a value, so I'm ignoring it for now.
+        'publisher' # I've never seen this field with a value, so I'm ignoring it for now.
     ]
 
     known_attrs = [
@@ -2034,6 +2304,40 @@ def process_lingsync_session(doc):
     date_modified = doc.get('dateModified')
     last_modified_by = doc.get('lastModifiedBy')
 
+    # Annotation Date. Ignoring this because I've never seen it not empty.
+    ls_annotationDate = get_val_from_session_fields('annotationDate',
+        session_fields)
+    if ls_annotationDate:
+        print 'Session has annotationDate: %s' % ls_annotationDate
+
+    # Annotations Funded By. Ignoring this because I've never seen it not empty.
+    ls_annotationsFundedBy = get_val_from_session_fields('annotationsFundedBy',
+        session_fields)
+    if ls_annotationsFundedBy:
+        print 'Session has annotationDate: %s' % ls_annotationDate
+
+    # Attribution Info. Ignoring this because I've never seen it not empty.
+    ls_attributionInfo = get_val_from_session_fields('attributionInfo',
+        session_fields)
+    if ls_attributionInfo:
+        print 'Session has ls_attributionInfo: %s' % ls_attributionInfo
+
+    # Collection. Ignoring this because I've never seen it not empty.
+    ls_collection = get_val_from_session_fields('collection', session_fields)
+    if ls_collection:
+        print 'Session has ls_collection: %s' % ls_collection
+
+    # Original Transcriber. Ignoring this because I've never seen it not empty.
+    ls_originalTranscriber = get_val_from_session_fields('originalTranscriber',
+        session_fields)
+    if ls_originalTranscriber:
+        print 'Session has ls_originalTranscriber: %s' % ls_originalTranscriber
+
+    # Publisher. Ignoring this because I've never seen it not empty.
+    ls_publisher = get_val_from_session_fields('publisher', session_fields)
+    if ls_publisher:
+        print 'Session has ls_publisher: %s' % ls_publisher
+
     # We use the dialect and language fields if present. If not, we try to get
     # these values from the corresponding attributes.
     dialect = get_val_from_session_fields('dialect', session_fields)
@@ -2045,19 +2349,23 @@ def process_lingsync_session(doc):
 
     # Title. Get the OLD collection's title value.
     if (not goal) or len(goal) == 0:
-        warnings['docspecific'].append('Session %s has no goal so its date elicited is being'
-            ' used for title of the the OLD collection built from it.' % (
-            session_id,))
+        if not QUIET:
+            warnings['docspecific'].append('Session %s has no goal so its date'
+                ' elicited is being used for title of the the OLD collection'
+                ' built from it.' % (session_id,))
         if date_session_elicited and len(date_session_elicited) > 0:
             title = u'Elicitation Session on %s' % date_session_elicited
         else:
-            warnings['docspecific'].append('Session %s has no date elicited so its id is being'
-                ' used for the title of the OLD collection built from it.' % (
-                session_id,))
+            if not QUIET:
+                warnings['docspecific'].append('Session %s has no date elicited so its id is being'
+                    ' used for the title of the OLD collection built from it.' % (
+                    session_id,))
             title = u'Elicitation Session %s' % session_id
     elif len(goal) > 255:
-        warnings['docspecific'].append('The goal "%s" of session %s is too long and will be'
-            ' truncated.' % (goal, session_id))
+        if not QUIET:
+            warnings['docspecific'].append('The goal "%s" of session %s is too long'
+                ' and will be truncated. However, its non-truncated form is in the'
+                ' collection\'s description field.' % (goal, session_id))
         title = goal[:255]
     else:
         title = goal
@@ -2101,8 +2409,9 @@ def process_lingsync_session(doc):
         comments_string = lingsync_comments2old_description(doc['comments'])
         if comments_string:
             description.append(comments_string)
-        description = u'\n\n'.join(description)
-        old_collection['description'] = description
+
+    description = u'\n\n'.join(description)
+    old_collection['description'] = description
 
     # Speaker.
     # Use the LingSync `consultants` and `dialect` fields to create one or more
@@ -2126,11 +2435,14 @@ def process_lingsync_session(doc):
     if len(speakers) >= 1:
         old_collection['speaker'] = speakers[0]
         if len(speakers) > 1:
-            warnings['docspecific'].append('Session %s has more than one consultant listed. Since'
-                ' OLD collections only allow one speaker, we are just going to'
-                ' associate the first speaker to the OLD collection created form this'
-                ' LingSync session. The additional LingSync speakers will still be'
-                ' created as OLD speakers, however.' % session_id)
+            if not QUIET:
+                warnings['docspecific'].append('Session %s has more than one consultant listed. Since'
+                    ' OLD collections only allow one speaker, we are just going to'
+                    ' associate the first speaker to the OLD collection created form this'
+                    ' LingSync session. The additional LingSync speakers will still be'
+                    ' created as OLD speakers, however, and all OLD collections'
+                    ' will list all of the consultants from their source'
+                    ' LingSync sessions in their description values.' % session_id)
     for speaker in speakers:
         auxiliary_resources.setdefault('speakers', []).append(speaker)
 
@@ -2268,10 +2580,22 @@ def lingsync_comments2old_description(comments_list):
 
     """
 
-    if len(comments_list) > 0:
-        print 'We have comments in this session!'
-        p(comments_list)
-    return ''
+    description = []
+    if type(comments_list) is list:
+        for comment in comments_list:
+            if type(comment) is dict:
+                if comment.get('text'):
+                    if comment.get('username'):
+                        description.append('User %s made this comment: %s' % (
+                            comment['username'],
+                            punctuate_period_safe(comment['text'])))
+                    else:
+                        description.append('Comment: %s' % (
+                            punctuate_period_safe(comment['text'])))
+    if len(description) > 0:
+        return u'\n\n'.join(description)
+    else:
+        return ''
 
 
 def main():
@@ -2283,6 +2607,29 @@ def main():
     lingsync_data_fname = download(options, lingsync_config, lingsync_db_name)
     old_data_fname = convert(options, lingsync_data_fname, lingsync_db_name)
     upload(options, old_data_fname)
+
+    # pprint.pprint(TAGSTOFIX)
+    with open('tag-fix-data.json', 'w') as outfile:
+        json.dump(TAGSTOFIX, outfile)
+    all_tags_created = set()
+    good_tags = set()
+    print '\n\n\n'
+    for tagorig, meta in TAGSTOFIX.iteritems():
+        all_tags_created.add(tagorig)
+        if tagorig == meta['tags_created'][0]:
+            good_tags.add(tagorig)
+        else:
+            good = [x.strip() for x in tagorig.split(',')]
+            print '"%s" =>\n    BAD: "%s"\n    GOOD: "%s"' % (
+                tagorig, '", "'.join(meta['tags_created']),
+                '", "'.join(good))
+            print
+
+    print '\n\n\n'
+    print 'GOOD TAGS'
+    print '\n'.join(sorted(list(good_tags)))
+    print '\n\n\n'
+
     cleanup()
 
 
@@ -2488,6 +2835,9 @@ def convert(options, lingsync_data_fname, lingsync_db_name):
     if old_data_fname is None:
         sys.exit('Unable to convert the LingSync JSON data to an OLD-compatible'
             ' format.\nAborting.')
+
+    print ', '.join(map(str, sorted(list(OVERFLOWS))))
+
     return old_data_fname
 
 
@@ -2807,14 +3157,36 @@ def create_old_corpora(old_data, c, old_url, relational_map):
                 relational_map['corpora'][datalist_id] = r['id']
                 resources_created.append(r['id'])
             except:
-                p(r)
-                sys.exit(u'%sFailed to create an OLD corpus for the LingSync'
-                    u' datalist \u2018%s\u2019. Aborting.%s' % (ANSI_FAIL,
-                    datalist_id, ANSI_ENDC))
-
+                if r.get('errors', {}).get('name') == u'The submitted value for Corpus.name is not unique.':
+                    corpus['name'] = '%s-%s' % (corpus['name'], randstr())
+                    r = c.create('corpora', corpus)
+                    try:
+                        assert r.get('id')
+                        relational_map['corpora'][datalist_id] = r['id']
+                        resources_created.append(r['id'])
+                    except:
+                        p(r)
+                        sys.exit(u'%sFailed to create an OLD corpus for the LingSync'
+                            u' datalist \u2018%s\u2019. Aborting.%s' % (ANSI_FAIL,
+                            datalist_id, ANSI_ENDC))
         print 'Done.'
 
     return (relational_map, resources_created)
+
+
+def randstr():
+    return ''.join(random.choice(string.letters) for x in range(8))
+
+
+def fix_morphemes(morphemes):
+    """Remove all sequences of question marks in morpheme_break and
+    morpheme_gloss values. These cause Internal Server Errors in the OLD.
+
+    """
+
+    while '??' in morphemes:
+        morphemes = morphemes.replace('??', '?-?')
+    return morphemes
 
 
 def create_old_forms(old_data, c, old_url, relational_map):
@@ -2840,6 +3212,7 @@ def create_old_forms(old_data, c, old_url, relational_map):
                 u' Aborting.%s' % (ANSI_FAIL, ANSI_ENDC))
 
         # Issue the create (POST) requests.
+        last_form = None
         for form in old_data['forms']:
 
             datum_id = form.get('__lingsync_datum_id')
@@ -2896,6 +3269,8 @@ def create_old_forms(old_data, c, old_url, relational_map):
 
             # Create the form on the OLD
             form['tags'].append(migration_tag_id)
+            form['morpheme_break'] = fix_morphemes(form['morpheme_break'])
+            form['morpheme_gloss'] = fix_morphemes(form['morpheme_gloss'])
             try:
                 r = c.create('forms', form)
             except requests.exceptions.SSLError:
@@ -2904,15 +3279,59 @@ def create_old_forms(old_data, c, old_url, relational_map):
                 r = c.create('forms', form, False)
             try:
                 assert r.get('id')
+                form['id'] = r['id']
                 resources_created['created'].append(r['id'])
                 # We don't want to map datum ids to form ids for
                 # trashed/deleted datums/forms.
                 if not form.get('__lingsync_deleted'):
                     relational_map['forms'][datum_id] = r['id']
-            except:
-                sys.exit(u'%sFailed to create an OLD form for the LingSync'
-                    u' datum \u2018%s\u2019. Aborting.%s' % (ANSI_FAIL,
-                    datum_id, ANSI_ENDC))
+            except Exception, e:
+                # This shouldn't happen, but sometimes the grammaticality value
+                # isn't recognized by the OLD's application settings. If so,
+                # remove it and print a warning for the user to fix it later.
+                if r.get('errors', {}).get('grammaticality') == u'The grammaticality submitted does not match any of the available options.':
+                    old_grammaticality = form['grammaticality']
+                    form['grammaticality'] = u''
+                    r = c.create('forms', form, False)
+                    try:
+                        assert r.get('id')
+                        form['id'] = r['id']
+                        resources_created['created'].append(r['id'])
+                        # We don't want to map datum ids to form ids for
+                        # trashed/deleted datums/forms.
+                        if not form.get('__lingsync_deleted'):
+                            relational_map['forms'][datum_id] = r['id']
+                        print ('WARNING: OLD form %d should have the'
+                            ' grammaticality value `%s`; however, that value was'
+                            ' not permitted so we created it with no'
+                            ' grammaticality value (i.e., as grammatical). Please'
+                            ' fix manually.' % (form['id'], old_grammaticality))
+                    except Exception, e:
+                        p(r)
+                        print e
+                        if r.get('error') == u'Internal Server Error':
+                            print '\n\nInternal Server Error when trying to create this form:'
+                            p(form)
+                            print 'No error when trying to create this form:'
+                            p(last_form)
+                            print '\n\n\n'
+                        else:
+                            sys.exit(u'%sFailed to create an OLD form for the LingSync'
+                                u' datum \u2018%s\u2019. Aborting.%s' % (ANSI_FAIL,
+                                datum_id, ANSI_ENDC))
+                else:
+                    p(r)
+                    print e
+                    if r.get('error') == u'Internal Server Error':
+                        print '\n\nInternal Server Error when trying to create this form:'
+                        p(form)
+                        print 'No error when trying to create this form:'
+                        p(last_form)
+                        print '\n\n\n'
+                    else:
+                        sys.exit(u'%sFailed to create an OLD form for the LingSync'
+                            u' datum \u2018%s\u2019. Aborting.%s' % (ANSI_FAIL,
+                            datum_id, ANSI_ENDC))
 
             # Delete migrated OLD forms that were previously trashed in
             # LingSync.
@@ -2926,6 +3345,59 @@ def create_old_forms(old_data, c, old_url, relational_map):
                     sys.exit(u'%sFailed to delete on the OLD the trashed'
                         u' LingSync form %s that was migrated.%s' % (ANSI_FAIL,
                         datum_id, ANSI_ENDC))
+
+            last_form = form
+
+        # If the form has "Links: " in it, then we convert the LingSync ids to
+        # OLD id references.
+        # The LingSync `links` field appears to consistently be a string of
+        # comma-separated expressions of the form "similarTo:4f868ba9a79e57479ddbe4f62ae671c8"
+        # where the string after the colon is a datum id.
+        patt = re.compile('similarTo:([a-f0-9]{32})')
+        def fix(m):
+            datum_id = m.group(1)
+            print 'in fix'
+            if relational_map:
+                print 'we have relational map'
+            form_id = relational_map['forms'].get(datum_id)
+            if form_id:
+                return 'form(%d)' % form_id
+            else:
+                return 'similar to LingSync datum %s' % datum_id
+        for form in old_data['forms']:
+            if u'Links: ' in form['comments']:
+                print 'requesting form for linking ...'
+                form_r = c.get('forms/%d' % form['id'])
+                print 'form_r is '
+                print form_r
+                if form_r.get('error'):
+                    print ('Form %d has LingSync links but we could not retrieve'
+                        ' it.' % form['id'])
+                    continue
+                form_r['comments'] = patt.sub(fix, form_r['comments'])
+                if form_r['elicitation_method']:
+                    form_r['elicitation_method'] = form_r['elicitation_method']['id']
+                if form_r['syntactic_category']:
+                    form_r['syntactic_category'] = form_r['syntactic_category']['id']
+                if form_r['speaker']:
+                    form_r['speaker'] = form_r['speaker']['id']
+                if form_r['elicitor']:
+                    form_r['elicitor'] = form_r['elicitor']['id']
+                if form_r['verifier']:
+                    form_r['verifier'] = form_r['verifier']['id']
+                if form_r['source']:
+                    form_r['source'] = form_r['source']['id']
+                if form_r['tags']:
+                    form_r['tags'] = [t['id'] for t in form_r['tags']]
+                if form_r['files']:
+                    form_r['files'] = [t['id'] for t in form_r['files']]
+                if form_r['date_elicited']:
+                    x = form_r['date_elicited']
+                    if len(x.split('-')) == 3:
+                        y, m, d = x.split('-')
+                        form_r['date_elicited'] = u'%s/%s/%s' % (m, d, y)
+                r = c.update('forms/%d' % form_r['id'], form_r)
+
         print 'Done.'
 
     return (relational_map, resources_created)
@@ -3135,6 +3607,8 @@ def create_old_speakers(old_data, c, old_url, relational_map):
 
         # Issue the create (POST) and update (PUT) requests.
         for speaker in speakers_to_create:
+            if (not speaker['first_name']) or (not speaker['last_name']):
+                continue
             r = c.create('speakers', speaker)
             key = u'%s %s' % (speaker['first_name'], speaker['last_name'])
             try:
@@ -3142,6 +3616,7 @@ def create_old_speakers(old_data, c, old_url, relational_map):
                 relational_map['speakers'][key] = r['id']
                 resources_created['created'].append(r['id'])
             except:
+                print r
                 sys.exit(u'%sFailed to create an OLD speaker \u2018%s\u2019.'
                     u' Aborting.%s' % (ANSI_FAIL, key, ANSI_ENDC))
         for speaker in speakers_to_update:
@@ -3164,6 +3639,36 @@ def create_old_speakers(old_data, c, old_url, relational_map):
     return (relational_map, resources_created)
 
 
+def fix_user_name(name):
+    """Make sure the user's username is a string/Unicode; if it's not,
+    try to make it into one. If we can't, we return `None`.
+
+    """
+
+    if type(name) is dict:
+        return name.get('username')
+    elif not isinstance(name, basestring):
+        return None
+    else:
+        return name
+
+
+def reconcile_users(users_list):
+    reconciled_user = {}
+    for user in users_list:
+        for attr, val in user.items():
+            reconciled_user.setdefault(attr, []).append(val)
+    for attr, val in reconciled_user.items():
+        reconciled_user[attr] = val[0]
+        # if len(set(val)) != 1:
+        #     # TODO: fix this, if we find migrations where this is needed.
+        #     print 'We must merge the following values for %s' % attr
+        #     for x in val:
+        #         print x
+        #     print
+    return reconciled_user
+
+
 def create_old_users(old_data, c, old_url, relational_map):
     """Create the users in `old_data` on the OLD that the client `c` is
     connected to.
@@ -3176,15 +3681,45 @@ def create_old_users(old_data, c, old_url, relational_map):
     }
 
     if old_data.get('users'):
+
         flush('Creating OLD users...')
         relational_map.setdefault('users', {})
         users_to_create = []
         users_to_update = []
         users = old_data.get('users')
-        usernames = [u['username'] for u in users]
+
+        # LingSync users may have objects/dicts as values for their 'username'
+        # fields. Therefore we transform these to strings here.
+        new_users = []
+        for user in users:
+            user['username'] = fix_user_name(user['username'])
+            user['first_name'] = fix_user_name(user['first_name'])
+            user['last_name'] = fix_user_name(user['last_name'])
+            if (not user['username']) or (not user['first_name']) or (not user['last_name']):
+                print 'WARNING: unable to create user ...'
+                pprint.pprint(user)
+                continue
+            else:
+                new_users.append(user)
+        users = new_users
+
+        # Because of the above processing, we may end up with multiple users
+        # with the same username. Since the OLD doesn't allow this, we have to
+        # fix it here.
+        new_users = []
+        usersdict = {}
+        for user in users:
+            usersdict.setdefault(user['username'], []).append(user)
+        for username, users_list in usersdict.iteritems():
+            if len(users_list) == 1:
+                new_users.append(users_list[0])
+            else:
+                new_users.append(reconcile_users(users_list))
+        users = new_users
 
         # Retrieve the existing users from the OLD. This may affect what users
         # we create.
+        usernames = [u['username'] for u in users]
         existing_users = c.get('users')
         existing_usernames = filter(None, [u.get('username') for u in
             existing_users])
@@ -3201,6 +3736,7 @@ def create_old_users(old_data, c, old_url, relational_map):
             if response in ['y', 'Y']:
                 ls_user_overwrites_old = True
 
+        # BEGIN GAP
         # Populate our lists of users to create and update. If a user already
         # exists, we may just use it instead of creating or even updating.
         for user in users:
@@ -3255,6 +3791,9 @@ def create_old_users(old_data, c, old_url, relational_map):
                             ANSI_FAIL, user['username'], ANSI_ENDC))
                 users_to_create.append(user)
 
+        # print 'Users to create:'
+        # pprint.pprint([u['username'] for u in users_to_create])
+
         # Issue the create (POST) and update (PUT) requests.
         for user in users_to_create:
             r = c.create('users', user)
@@ -3267,9 +3806,14 @@ def create_old_users(old_data, c, old_url, relational_map):
                 relational_map['users'][key] = r['id']
                 users_created['created'].append(key)
             except:
+                print 'failed to create this user'
+                pprint.pprint(user)
+                pprint.pprint(r)
                 sys.exit(u'%sFailed to create an OLD user with username'
                     u' \u2018%s\u2019. Aborting.%s' % (ANSI_FAIL,
                     user['username'], ANSI_ENDC))
+
+        # END GAP
         for user in users_to_update:
             r = c.update('users/%s' % user['id'], user)
             users_created['updated'].append(user['username'])
