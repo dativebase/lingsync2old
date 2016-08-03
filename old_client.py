@@ -25,7 +25,10 @@ server-side OLD web service.
 import requests
 import codecs
 import unicodedata
-import simplejson as json
+try:
+    import simplejson as json
+except ImportError:
+    import json
 from time import sleep
 import locale
 import sys
@@ -77,7 +80,7 @@ class OLDClient(object):
     def login(self, username, password):
         payload = json.dumps({'username': username, 'password': password})
         response = self.session.post('%s/login/authenticate' % self.url,
-            data=payload)
+            data=payload, verify=False)
         return response.json().get('authenticated', False)
 
     def get(self, path, params=None, verbose=True):
