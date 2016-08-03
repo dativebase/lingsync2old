@@ -547,7 +547,9 @@ def lingsync2old(fname, lingsync_db_name, force_file_download):
         if get_collection_for_lingsync_doc(r.get('doc', {})) == 'datums':
             old_object = process_lingsync_datum(r['doc'],
                 old_data['collections'], lingsync_db_name)
-            old_data, warnings = update_state(old_object, old_data, warnings)
+            if old_object:
+                old_data, warnings = update_state(
+                    old_object, old_data, warnings)
 
     # Note: LingSync corpus and private_corpus documents don't appear to
     # contain any data that need to be migrated to the OLD. They contain
@@ -1293,7 +1295,11 @@ def process_lingsync_user(doc):
         # Ignoring the following:
         'api',
         'fieldDBtype',
-        'version'
+        'version',
+        # New from weisskircherisch. Ignored.
+        'appbrand',
+        'corpora',
+        'dateCreated'
     ]
 
     # Add warnings to this.
@@ -1319,6 +1325,21 @@ def process_lingsync_user(doc):
 
     # This dict will be used to create the OLD user.
     old_user = copy.deepcopy(old_schemata['user'])
+
+    # Attested value: "lingsync". Ignoring.
+    ls_appbrand = doc.get('appbrand')
+    # if ls_appbrand:
+    #     print 'User has appbrand: %s' % ls_appbrand
+
+    # Attested value: array of corpus objects. Ignoring.
+    ls_corpora = doc.get('corpora')
+    # if ls_corpora:
+    #     print 'User has corpora: %s' % ls_corpora
+
+    # Attested value: Unix timestamp, assumedly when user was created. Ignoring.
+    ls_dateCreated = doc.get('dateCreated')
+    # if ls_dateCreated:
+    #     print 'User has dateCreated: %s' % ls_dateCreated
 
     ls_username = my_strip(doc.get('username'))
     ls_firstname = my_strip(doc.get('firstname'))
@@ -1388,7 +1409,12 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     # p(doc)
 
     datum_id = doc['_id']
-    datum_fields = doc['datumFields']
+    datum_fields = doc.get('datumFields', doc.get('fields'))
+    if datum_fields is None:
+        print 'Warning: unable to retrieve datumFields for datum %s' % datum_id
+        p(doc)
+        print '\n'
+        return None
 
     # These are the LingSync datum fields that we know how to deal with for
     # to-OLD conversion.
@@ -1433,7 +1459,21 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         'undefined', # Ignorable: never has a real value; only values ever seen are sequences of question marks.
         'chapter', # Used in gina-inuktitut for chapter of Genesis.
         'dateSEntered', # Timestamp that is ignored.
-        'verse' # Used in gina-inuktitut for verse of Genesis.
+        'verse', # Used in gina-inuktitut for verse of Genesis.
+        # New fields from weisskircherisch-firstcorpus
+        'audioFileName',
+        'begintimehh:mm:ssms',
+        'begintimehhMmSsms',
+        'endTime',
+        'fields',
+        'genDach',
+        'german',
+        'modality',
+        'relatedData',
+        'rudi',
+        'startTime',
+        'tier',
+        'ursula'
     ]
 
     known_attrs = [
@@ -1445,6 +1485,7 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         'dateEntered', # u'2015-04-01T16:50:30.852Z',
         'dateModified', # u'2015-04-01T16:50:30.852Z',
         'datumFields', # []
+        'fields', # [] Sometimes used instead of 'datumFields'
         'datumTags', # [],
         'images', # [],
         'jsonType', # u'Datum',
@@ -1561,11 +1602,13 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     if ls_datumStates:
         print 'datumStates: %s\n' % ls_datumStates
 
-    # Some datums have a 'documentation' field; however, I have yet to see such
-    # a field whose value was not the empty string.
+    # Some datums have a 'documentation' field; adding it to the comments field.
     ls_documentation = get_val_from_datum_fields('documentation', datum_fields)
     if ls_documentation:
-        print '\n\ndocumentation in datum; value is "%s".\n\n' % ls_documentation
+        ls_documentation = ls_documentation.strip()
+        old_comments.append(
+            u'Documentation: \u2018%s\u2019' % punctuate_period_safe(
+                ls_documentation))
 
     # Date Elicited. Date in 'MM/DD/YYYY' format. From
     # datum.session.sessionFields.dateElicited.
@@ -1647,7 +1690,7 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
                 # We're guessing the MIME type based on the extension, not the
                 # file contents, cuz we're lazy right now...
                 mime_type = mimetypes.guess_type(av['URL'])[0]
-                print mime_type
+                print 'MIME type of audioVideo object: %s' % mime_type
                 if (not mime_type) or (mime_type not in old_allowed_file_types):
                     continue
                 old_file = copy.deepcopy(old_schemata['file'])
@@ -1662,6 +1705,13 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
                 old_file['description'] = u'\n\n'.join(file_description)
                 if av.get('filename'):
                     old_file['filename'] = av['filename'].strip()
+
+                # The only value I've seen here is "304 Not Modified", i.e., an
+                # HTTP status code. Ignoring this.
+                ls_av_uploadStatus = av.get('uploadStatus', u'')
+                # if ls_av_uploadStatus:
+                #     print 'audioVideo uploadStatus: %s' % ls_av_uploadStatus
+
                 # Loop through all of the A/V attributes that are "known"
                 # and issue warnings when unknown ones are encountered.
                 for attr in av:
@@ -1938,6 +1988,93 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
         else:
             old_form['phonetic_transcription'] = ls_phonetic
 
+    ############################################################################
+    # START New datum fields from weisskircherisch-firstcorpus
+    ############################################################################
+
+    # german field (in weisskircherisch) is an (assumedly Standard German)
+    # rendering/translation of the Transylvanian Saxon utterance. Putting it in
+    # the comments field.
+    ls_german = get_val_from_datum_fields('german', datum_fields)
+    if ls_german:
+        old_comments.append(
+            u'German: \u2018%s\u2019' % punctuate_period_safe(ls_german))
+
+    # rudi field (in weisskircherisch) is like the German field, an alternative
+    # transcription of some kind.
+    ls_rudi = get_val_from_datum_fields('rudi', datum_fields)
+    if ls_rudi:
+        old_comments.append(
+            u'Rudi: \u2018%s\u2019' % punctuate_period_safe(ls_rudi))
+
+    # ursula field (in weisskircherisch) is like the German field, an
+    # alternative transcription of some kind.
+    ls_ursula = get_val_from_datum_fields('ursula', datum_fields)
+    if ls_ursula:
+        old_comments.append(
+            u'Ursula: \u2018%s\u2019' % punctuate_period_safe(ls_ursula))
+
+    # audioFileName. Ignoring this: no value attested yet.
+    ls_audioFileName = get_val_from_datum_fields('audioFileName', datum_fields)
+    if ls_audioFileName:
+        print 'Datum has ls_audioFileName: ', ls_audioFileName
+
+    # begintimehh:mm:ssms. Assumedly the time in an audio/video file that the
+    # utterance comes from. Format is (hh:)mm:ss.ms, e.t., "49:37.9".
+    ls_begintimehhmmssms = get_val_from_datum_fields('begintimehh:mm:ssms', datum_fields)
+    if ls_begintimehhmmssms:
+        old_comments.append(
+                u'Begin time (hh:mm:ss.ms): %s' % punctuate_period_safe(
+                    str(ls_begintimehhmmssms)))
+
+    # begintimehhMmSsms. Ignoring this: no value attested. Assumedly the time
+    # in an audio/video file that the utterance comes from.
+    ls_begintimehhMmSsms = get_val_from_datum_fields(
+        'begintimehhMmSsms', datum_fields)
+    if ls_begintimehhMmSsms:
+        print 'Datum has ls_begintimehhMmSsms: ', ls_begintimehhMmSsms
+
+    # endTime. Ignoring this: no value attested.
+    ls_endTime = get_val_from_datum_fields('endTime', datum_fields)
+    if ls_endTime:
+        print 'Datum has ls_endTime: ', ls_endTime
+
+    # fields. Ignoring this: no value attested.
+    ls_fields = get_val_from_datum_fields('fields', datum_fields)
+    if ls_fields:
+        print 'Datum has ls_fields: ', ls_fields
+
+    # genDach. Ignoring this: no value attested.
+    ls_genDach = get_val_from_datum_fields('genDach', datum_fields)
+    if ls_genDach:
+        print 'Datum has ls_genDach: ', ls_genDach
+
+    # modality. Only one token attested ("spoken"). Creating it as an OLD tag.
+    ls_modality = get_val_from_datum_fields('modality', datum_fields)
+    if ls_modality:
+        old_tags.append({
+            'name': u'modality: %s' % ls_modality,
+            'description': u''
+        })
+
+    # relatedData. Ignoring this: no value attested.
+    ls_relatedData = get_val_from_datum_fields('relatedData', datum_fields)
+    if ls_relatedData:
+        print 'Datum has ls_relatedData: ', ls_relatedData
+
+    # startTime. Ignoring this: no value attested.
+    ls_startTime = get_val_from_datum_fields('startTime', datum_fields)
+    if ls_startTime:
+        print 'Datum has ls_startTime: ', ls_startTime
+
+    # tier. Ignoring this: no value attested.
+    ls_tier = get_val_from_datum_fields('tier', datum_fields)
+    if ls_tier:
+        print 'Datum has ls_tier: ', ls_tier
+
+    ############################################################################
+    # END New datum fields from weisskircherisch-firstcorpus
+    ############################################################################
 
     # Grammaticality. From LingSync judgement (or from LingSync judgment, note spelling)
 
@@ -2185,7 +2322,9 @@ known_audio_video_attrs = [
     'uploadInfo',
     'version',
     'webResultInfo',
-    'webResultStatus'
+    'webResultStatus',
+    # New from weisskircherisch corpus
+    'uploadStatus'
 ]
 
 
@@ -2235,7 +2374,12 @@ def process_lingsync_session(doc):
         'attributionInfo', # I've never seen this field with a value, so I'm ignoring it for now.
         'collection', # I've never seen this field with a value, so I'm ignoring it for now.
         'originalTranscriber', # I've never seen this field with a value, so I'm ignoring it for now.
-        'publisher' # I've never seen this field with a value, so I'm ignoring it for now.
+        'publisher', # I've never seen this field with a value, so I'm ignoring it for now.
+        # new fields from weisskircherisch
+        'device',
+        'location',
+        'register',
+        'source'
     ]
 
     known_attrs = [
@@ -2304,6 +2448,38 @@ def process_lingsync_session(doc):
     date_modified = doc.get('dateModified')
     last_modified_by = doc.get('lastModifiedBy')
 
+    ############################################################################
+    # START New session fields from weisskircherisch corpus
+    ############################################################################
+
+    # Device. Ignoring this because I've never seen it not empty.
+    ls_device = get_val_from_session_fields('device',
+        session_fields)
+    if ls_device:
+        print 'Session has device: %s' % ls_device
+
+    # Location. Ignoring this because I've never seen it not empty.
+    ls_location = get_val_from_session_fields('location',
+        session_fields)
+    if ls_location:
+        print 'Session has location: %s' % ls_location
+
+    # Register. Ignoring this because I've never seen it not empty.
+    ls_register = get_val_from_session_fields('register',
+        session_fields)
+    if ls_register:
+        print 'Session has register: %s' % ls_register
+
+    # Source. Ignoring this because I've never seen it not empty.
+    ls_source = get_val_from_session_fields('source',
+        session_fields)
+    if ls_source and ls_source not in ('XY', 'Unknown'):
+        print 'Session has source: %s' % ls_source
+
+    ############################################################################
+    # END New session fields from weisskircherisch corpus
+    ############################################################################
+
     # Annotation Date. Ignoring this because I've never seen it not empty.
     ls_annotationDate = get_val_from_session_fields('annotationDate',
         session_fields)
@@ -2314,7 +2490,7 @@ def process_lingsync_session(doc):
     ls_annotationsFundedBy = get_val_from_session_fields('annotationsFundedBy',
         session_fields)
     if ls_annotationsFundedBy:
-        print 'Session has annotationDate: %s' % ls_annotationDate
+        print 'Session has annotationsFundedBy: %s' % ls_annotationsFundedBy
 
     # Attribution Info. Ignoring this because I've never seen it not empty.
     ls_attributionInfo = get_val_from_session_fields('attributionInfo',
