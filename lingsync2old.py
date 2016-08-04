@@ -2060,7 +2060,12 @@ def process_lingsync_datum(doc, collections, lingsync_db_name):
     # relatedData. Ignoring this: no value attested.
     ls_relatedData = get_val_from_datum_fields('relatedData', datum_fields)
     if ls_relatedData:
-        print 'Datum has ls_relatedData: ', ls_relatedData
+        if (isinstance(ls_relatedData, dict) and
+                isinstance(ls_relatedData.get('relatedData'), list) and
+                len(ls_relatedData['relatedData']) == 0):
+            pass
+        else:
+            print 'Datum has ls_relatedData: ', ls_relatedData
 
     # startTime. Ignoring this: no value attested.
     ls_startTime = get_val_from_datum_fields('startTime', datum_fields)
@@ -2731,8 +2736,9 @@ def get_dict_from_datum_fields(attr, datum_fields):
     elif len(val_list) is 1:
         return val_list[0]
     else:
-        print 'WARNING: more than one %s in field list!' % attr
-        p(val_list)
+        if len(set([x.get('value') for x in val_list])) != 1:
+            print 'WARNING: more than one %s in field list!' % attr
+            p(val_list)
         return val_list[0]
 
 
